@@ -2,36 +2,49 @@
 
 import { useMemo, useState } from 'react';
 import {
-  AlertTriangle,
   ArrowDown,
   ArrowUp,
   CircleDollarSign,
   ClipboardPaste,
   PieChart,
-  Scale,
   WalletCards,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
+import {
+  Sheet,
+  SheetClose,
+  SheetContent,
+  SheetDescription,
+  SheetFooter,
+  SheetHeader,
+  SheetTitle,
+  SheetTrigger,
+} from '@/components/ui/sheet';
 import { Textarea } from '@/components/ui/textarea';
 
 type Holding = {
   name: string;
   ticker: string;
   exchange: string;
+  accounts: string[];
   quantity: number;
   marketYen: number;
   marketUsd: number;
-  pnlYenPct: number;
+  pnlPct: number;
 };
-type Category = 'core' | 'defensive' | 'satellite' | 'speculative';
+type Category = 'core' | 'satellite' | 'speculative';
+type SortBy = 'weight' | 'return' | 'category';
 
 const CATEGORY_META: Record<
   Category | 'cash',
   { label: string; color: string; soft: string }
 > = {
   core: { label: '核心长期仓', color: '#547a42', soft: '#edf5d8' },
-  defensive: { label: '防守资产', color: '#54798a', soft: '#e8f1f4' },
-  satellite: { label: '优质个股仓', color: '#d49a36', soft: '#fff3d8' },
+  satellite: {
+    label: '卫星仓（优质个股/行业ETF）',
+    color: '#d49a36',
+    soft: '#fff3d8',
+  },
   speculative: { label: '投机仓', color: '#c66052', soft: '#fbe9e5' },
   cash: { label: '现金仓', color: '#87918d', soft: '#edf0ef' },
 };
@@ -49,6 +62,7 @@ const DEFAULT_CATEGORIES: Record<string, Category> = {
   INTC: 'speculative',
   CELH: 'speculative',
   STZ: 'speculative',
+  SOXL: 'speculative',
 };
 
 const SAMPLE = `サンプル S&P 500 ETF
@@ -95,11 +109,7 @@ function numberOf(value: string) {
   return Number(value.replace(/[,+]/g, ''));
 }
 
-function parsePortfolio(raw: string) {
-  const lines = raw
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean);
+function parseDetailedPortfolio(lines: string[]) {
   const holdings: Holding[] = [];
   const tickerPattern =
     /^([A-Z][A-Z0-9.-]*)(NASDAQ|NYSE(?:\s+Arca)?|NYSE\s+American)$/;
@@ -128,10 +138,11 @@ function parsePortfolio(raw: string) {
       name: lines[index - 1],
       ticker: match[1],
       exchange: match[2],
+      accounts: [],
       quantity: quantity ? numberOf(quantity) : 0,
       marketUsd: usd[3],
       marketYen: yen[3],
-      pnlYenPct: percents[1] ?? 0,
+      pnlPct: percents[1] ?? 0,
     });
   }
   const cashStart = lines.findIndex((line) => line === '預り金');
@@ -149,44 +160,200 @@ function parsePortfolio(raw: string) {
   };
 }
 
+function parseCompactPortfolio(lines: string[]) {
+  const rows: (Holding & { pnlUsd: number })[] = [];
+  let account = '';
+  const accountPattern = /^米国株式\(現物\/(一般預り|NISA預り)\)$/;
+  const matchSecurity = (line: string) => {
+    for (let split = 1; split <= Math.min(6, line.length - 1); split += 1) {
+      const ticker = line.slice(0, split);
+      const name = line.slice(split);
+      if (
+        /^[A-Z][A-Z0-9.-]*$/.test(ticker) &&
+        (/^[^\x00-\x7F]/.test(name) || /^[A-Z][a-z]/.test(name))
+      ) {
+        return { ticker, name };
+      }
+    }
+    return null;
+  };
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const accountMatch = lines[index].match(accountPattern);
+    if (accountMatch) {
+      account = accountMatch[1] === 'NISA預り' ? 'NISA' : '一般';
+      continue;
+    }
+    const securityMatch = matchSecurity(lines[index]);
+    if (!account || !securityMatch) continue;
+
+    const numbers: number[] = [];
+    for (let cursor = index + 1; cursor < lines.length; cursor += 1) {
+      if (accountPattern.test(lines[cursor]) || matchSecurity(lines[cursor]))
+        break;
+      if (/^[-+]?\d[\d,]*(?:\.\d+)?$/.test(lines[cursor])) {
+        numbers.push(numberOf(lines[cursor]));
+      }
+    }
+    if (numbers.length < 4) continue;
+    const [quantity, averagePrice, currentPrice, pnlUsd] = numbers;
+    const cost = quantity * averagePrice;
+    rows.push({
+      name: securityMatch.name,
+      ticker: securityMatch.ticker,
+      exchange: '',
+      accounts: [account],
+      quantity,
+      marketYen: 0,
+      marketUsd: quantity * currentPrice,
+      pnlUsd,
+      pnlPct: cost ? (pnlUsd / cost) * 100 : 0,
+    });
+  }
+
+  const merged = new Map<string, Holding & { pnlUsd: number }>();
+  rows.forEach((row) => {
+    const current = merged.get(row.ticker);
+    if (!current) {
+      merged.set(row.ticker, { ...row });
+      return;
+    }
+    const combinedPnl = current.pnlUsd + row.pnlUsd;
+    const combinedMarket = current.marketUsd + row.marketUsd;
+    const combinedCost = combinedMarket - combinedPnl;
+    merged.set(row.ticker, {
+      ...current,
+      accounts: Array.from(new Set([...current.accounts, ...row.accounts])),
+      quantity: current.quantity + row.quantity,
+      marketUsd: combinedMarket,
+      pnlUsd: combinedPnl,
+      pnlPct: combinedCost ? (combinedPnl / combinedCost) * 100 : 0,
+    });
+  });
+  return Array.from(merged.values());
+}
+
+function parsePortfolio(raw: string) {
+  const lines = raw
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const detailed = parseDetailedPortfolio(lines);
+  if (detailed.holdings.length) {
+    return { ...detailed, currency: 'JPY' as const };
+  }
+  return {
+    holdings: parseCompactPortfolio(lines),
+    cashYen: 0,
+    cashUsd: 0,
+    currency: 'USD' as const,
+  };
+}
+
 const yen = new Intl.NumberFormat('ja-JP', {
   style: 'currency',
   currency: 'JPY',
   maximumFractionDigits: 0,
 });
+const usd = new Intl.NumberFormat('en-US', {
+  style: 'currency',
+  currency: 'USD',
+  minimumFractionDigits: 2,
+});
+
+function riskTags(item: Holding, category: Category, weight: number) {
+  const tags: { label: string; tone: 'profit' | 'loss' | 'rebalance' }[] = [];
+
+  if (category === 'satellite') {
+    if (item.pnlPct <= -20) {
+      tags.push({ label: '止损复核：跌幅≥20%', tone: 'loss' });
+    }
+    if (weight > 5) {
+      tags.push({
+        label: '再平衡：仓位超过5%，减至3%–4%',
+        tone: 'rebalance',
+      });
+      if (item.pnlPct > 0) {
+        tags.push({ label: '止盈：兑现超额仓位', tone: 'profit' });
+      }
+    }
+  }
+
+  if (category === 'speculative') {
+    if (item.pnlPct <= -8) {
+      tags.push({ label: '止损：进入8%–12%区间', tone: 'loss' });
+    } else if (item.pnlPct >= 40) {
+      tags.push({ label: '二次止盈：再卖1/3', tone: 'profit' });
+    } else if (item.pnlPct >= 20) {
+      tags.push({ label: '首次止盈：卖1/3', tone: 'profit' });
+    }
+    if (weight > 2) {
+      tags.push({
+        label: '再平衡：投机仓单标的超过2%',
+        tone: 'rebalance',
+      });
+    }
+  }
+
+  return tags;
+}
 
 export default function Home() {
   const [raw, setRaw] = useState(SAMPLE);
+  const [manualCash, setManualCash] = useState('');
   const [categories, setCategories] =
     useState<Record<string, Category>>(DEFAULT_CATEGORIES);
+  const [sortBy, setSortBy] = useState<SortBy>('weight');
   const [targets, setTargets] = useState<Record<Category | 'cash', number>>({
     core: 55,
-    defensive: 15,
-    satellite: 15,
+    satellite: 30,
     speculative: 5,
     cash: 10,
   });
   const portfolio = useMemo(() => parsePortfolio(raw), [raw]);
+  const positionValue = (item: Holding) =>
+    portfolio.currency === 'JPY' ? item.marketYen : item.marketUsd;
+  const importedCashValue =
+    portfolio.currency === 'JPY' ? portfolio.cashYen : portfolio.cashUsd;
+  const hasManualCash = manualCash.trim() !== '';
+  const cashValue = hasManualCash
+    ? Math.max(0, Number(manualCash.replace(/[,\s]/g, '')) || 0)
+    : importedCashValue;
+  const formatMoney = (value: number) =>
+    portfolio.currency === 'JPY' ? yen.format(value) : usd.format(value);
   const invested = portfolio.holdings.reduce(
-    (sum, item) => sum + item.marketYen,
+    (sum, item) => sum + positionValue(item),
     0,
   );
-  const total = invested + portfolio.cashYen;
+  const total = invested + cashValue;
   const allocation = useMemo(() => {
     const result: Record<Category | 'cash', number> = {
       core: 0,
-      defensive: 0,
       satellite: 0,
       speculative: 0,
-      cash: portfolio.cashYen,
+      cash: cashValue,
     };
     portfolio.holdings.forEach((item) => {
-      result[categories[item.ticker] ?? 'satellite'] += item.marketYen;
+      result[categories[item.ticker] ?? 'satellite'] += positionValue(item);
     });
     return result;
-  }, [portfolio, categories]);
+  }, [portfolio, categories, cashValue]);
   const categoryKeys = Object.keys(CATEGORY_META) as (Category | 'cash')[];
+  const categoryOrder: Category[] = ['core', 'satellite', 'speculative'];
+  const sortedHoldings = [...portfolio.holdings].sort((a, b) => {
+    if (sortBy === 'return') return b.pnlPct - a.pnlPct;
+    if (sortBy === 'category') {
+      const categoryDifference =
+        categoryOrder.indexOf(categories[a.ticker] ?? 'satellite') -
+        categoryOrder.indexOf(categories[b.ticker] ?? 'satellite');
+      return categoryDifference || positionValue(b) - positionValue(a);
+    }
+    return positionValue(b) - positionValue(a);
+  });
   const targetTotal = categoryKeys.reduce((sum, key) => sum + targets[key], 0);
+  const targetsAreValid = Math.abs(targetTotal - 100) < 0.01;
+  const cashPct = total ? (cashValue / total) * 100 : 0;
+  const cashGapPct = targets.cash - cashPct;
   const segments = categoryKeys.map((key) => ({
     key,
     pct: total ? (allocation[key] / total) * 100 : 0,
@@ -202,7 +369,7 @@ export default function Home() {
   return (
     <main className="min-h-screen bg-background text-foreground">
       <header className="border-b border-white/8 bg-[#102723] text-white">
-        <div className="mx-auto flex max-w-[1500px] items-center justify-between px-5 py-4 lg:px-8">
+        <div className="mx-auto flex max-w-[1800px] items-center justify-between px-5 py-4 lg:px-8">
           <div className="flex items-center gap-3">
             <span className="grid size-9 place-items-center rounded-xl bg-[#d7ff77] text-[#102723]">
               <PieChart size={18} />
@@ -219,41 +386,31 @@ export default function Home() {
           </span>
         </div>
       </header>
-      <section className="mx-auto max-w-[1500px] px-5 py-7 lg:px-8">
+      <section className="mx-auto max-w-[1800px] px-5 py-7 lg:px-8">
         <div className="mb-6 flex flex-col justify-between gap-3 md:flex-row md:items-end">
           <div>
             <p className="mb-2 text-xs font-semibold uppercase tracking-[.2em] text-[#557269]">
               Allocation workspace
             </p>
-            <h1 className="text-3xl font-semibold tracking-[-.04em] sm:text-4xl">
-              把券商文本，变成可执行的仓位计划
-            </h1>
+
           </div>
           <p className="max-w-md text-sm leading-6 text-muted-foreground">
-            粘贴日文持仓明细，即时计算日元权重与集中度。
+            粘贴日文持仓明细，即时计算权重与集中度。
           </p>
         </div>
         <div className="grid gap-4 md:grid-cols-3">
           {[
             {
               label: '组合总额',
-              value: yen.format(total),
+              value: formatMoney(total),
               detail: `${portfolio.holdings.length} 只证券`,
               icon: WalletCards,
             },
             {
               label: '已投资产',
-              value: yen.format(invested),
+              value: formatMoney(invested),
               detail: total ? `${((invested / total) * 100).toFixed(1)}%` : '—',
               icon: PieChart,
-            },
-            {
-              label: '美元现金',
-              value: yen.format(portfolio.cashYen),
-              detail: total
-                ? `${((portfolio.cashYen / total) * 100).toFixed(1)}% · $${portfolio.cashUsd.toLocaleString()}`
-                : '—',
-              icon: CircleDollarSign,
             },
           ].map((item) => (
             <article
@@ -272,147 +429,297 @@ export default function Home() {
               </p>
             </article>
           ))}
-        </div>
-        <div className="mt-5 grid gap-5 xl:grid-cols-[380px_minmax(0,1fr)]">
-          <aside className="rounded-2xl border bg-card p-5">
-            <div className="mb-3 flex items-center justify-between">
+          <article className="rounded-2xl border bg-card p-5 shadow-[0_1px_0_rgba(16,39,35,.05)]">
+            <div className="mb-3 flex items-center justify-between text-muted-foreground">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="text-sm">现金仓</span>
+                <span
+                  className={`inline-flex rounded-full px-2.5 py-1 text-[11px] font-semibold ${!targetsAreValid ? 'bg-[#fff0cf] text-[#906414]' : cashGapPct > 1.5 ? 'bg-[#edf5d8] text-[#355026]' : cashGapPct < -1.5 ? 'bg-[#fbe9e5] text-[#a6463a]' : 'bg-[#edf0ef] text-[#586460]'}`}
+                >
+                  {!targetsAreValid
+                    ? '等待目标合计100%'
+                    : cashGapPct > 1.5
+                      ? `建议增持现金 ${cashGapPct.toFixed(1)}个百分点`
+                      : cashGapPct < -1.5
+                        ? `建议减持现金 ${Math.abs(cashGapPct).toFixed(1)}个百分点`
+                        : '现金接近目标'}
+                </span>
+              </div>
+              <CircleDollarSign size={18} />
+            </div>
+            <div className="flex items-end justify-between gap-3">
               <div>
-                <h2 className="font-semibold">导入券商文本</h2>
+                <p className="text-2xl font-semibold tracking-tight">
+                  {formatMoney(cashValue)}
+                </p>
                 <p className="mt-1 text-xs text-muted-foreground">
-                  支持 NASDAQ / NYSE / NYSE Arca
+                  {total ? `${cashPct.toFixed(1)}%` : '—'}
+                  {hasManualCash
+                    ? ' · 使用手动输入'
+                    : portfolio.currency === 'JPY' && portfolio.cashUsd
+                      ? ` · 券商读取 $${portfolio.cashUsd.toLocaleString()}`
+                      : ' · 使用券商读取值'}
                 </p>
               </div>
-              <ClipboardPaste className="text-[#557269]" size={19} />
+              {hasManualCash && (
+                <button
+                  type="button"
+                  onClick={() => setManualCash('')}
+                  className="shrink-0 text-xs font-medium text-[#557269] underline-offset-4 hover:underline"
+                >
+                  恢复读取值
+                </button>
+              )}
             </div>
-            <Textarea
-              aria-label="券商持仓文本"
-              value={raw}
-              onChange={(event) => setRaw(event.target.value)}
-              className="h-[430px] resize-none bg-[#f6f7f2] font-mono text-xs leading-5"
-            />
-            <Button
-              className="mt-3 w-full bg-[#102723] text-white hover:bg-[#173a34]"
-              onClick={() => setRaw(SAMPLE)}
-            >
-              恢复示例数据
-            </Button>
-          </aside>
+            <label className="mt-4 block text-xs font-medium text-muted-foreground">
+              手动输入现金（{portfolio.currency}）
+              <input
+                aria-label={`手动输入现金（${portfolio.currency}）`}
+                inputMode="decimal"
+                value={manualCash}
+                onChange={(event) => setManualCash(event.target.value)}
+                placeholder={`留空则使用券商读取值 ${formatMoney(importedCashValue)}`}
+                className="mt-1.5 w-full rounded-lg border bg-[#f6f7f2] px-3 py-2 text-sm font-medium tabular-nums text-foreground outline-none placeholder:text-xs placeholder:font-normal focus:ring-2 focus:ring-[#8faf52]"
+              />
+            </label>
+          </article>
+        </div>
+        <div className="mt-5">
           <section className="overflow-hidden rounded-2xl border bg-card">
-            <div className="flex items-center justify-between border-b px-5 py-4">
+            <div className="flex flex-wrap items-center justify-between gap-3 border-b px-5 py-4">
               <div>
                 <h2 className="font-semibold">持仓权重</h2>
                 <p className="mt-1 text-xs text-muted-foreground">
-                  按日元评价额计算·分类可修改
+                  按{portfolio.currency === 'JPY' ? '日元' : '美元'}
+                  评价额计算·分类可修改
                 </p>
               </div>
-              <span className="rounded-full bg-[#edf5d8] px-3 py-1 text-xs font-medium text-[#355026]">
-                已识别 {portfolio.holdings.length} 项
-              </span>
+              <div className="flex items-center gap-2">
+                <Sheet>
+                  <SheetTrigger
+                    render={
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="gap-2 bg-white"
+                      />
+                    }
+                  >
+                    <ClipboardPaste size={15} />
+                    导入券商文本
+                  </SheetTrigger>
+                  <SheetContent
+                    side="right"
+                    className="!w-[min(92vw,640px)] !max-w-[640px] gap-0 bg-[#fffefb]"
+                  >
+                    <SheetHeader className="border-b px-6 py-5">
+                      <SheetTitle className="text-lg">导入券商文本</SheetTitle>
+                      <SheetDescription>
+                        粘贴详细格式，或一般 / NISA
+                        简表格式。内容只在浏览器中处理。
+                      </SheetDescription>
+                    </SheetHeader>
+                    <div className="flex min-h-0 flex-1 flex-col px-6 py-5">
+                      <Textarea
+                        aria-label="券商持仓文本"
+                        value={raw}
+                        onChange={(event) => setRaw(event.target.value)}
+                        className="min-h-[55vh] flex-1 resize-none bg-[#f6f7f2] font-mono text-xs leading-5"
+                      />
+                      <p className="mt-3 text-xs text-muted-foreground">
+                        已识别 {portfolio.holdings.length}{' '}
+                        项持仓，修改文本后会立即重新计算。
+                      </p>
+                    </div>
+                    <SheetFooter className="flex-row border-t px-6 py-4">
+                      <Button
+                        variant="outline"
+                        className="flex-1"
+                        onClick={() => setRaw(SAMPLE)}
+                      >
+                        恢复示例数据
+                      </Button>
+                      <SheetClose
+                        render={
+                          <Button className="flex-1 bg-[#102723] text-white hover:bg-[#173a34]" />
+                        }
+                      >
+                        完成导入
+                      </SheetClose>
+                    </SheetFooter>
+                  </SheetContent>
+                </Sheet>
+                <label
+                  htmlFor="holding-sort"
+                  className="text-xs text-muted-foreground"
+                >
+                  排序
+                </label>
+                <select
+                  id="holding-sort"
+                  value={sortBy}
+                  onChange={(event) => setSortBy(event.target.value as SortBy)}
+                  className="rounded-lg border bg-white px-2.5 py-1.5 text-xs font-medium outline-none focus:ring-2 focus:ring-[#8faf52]"
+                >
+                  <option value="weight">按权重</option>
+                  <option value="return">按收益率</option>
+                  <option value="category">按类型</option>
+                </select>
+                <span className="rounded-full bg-[#edf5d8] px-3 py-1 text-xs font-medium text-[#355026]">
+                  已识别 {portfolio.holdings.length} 项
+                </span>
+              </div>
             </div>
             <div className="overflow-x-auto">
-              <table className="w-full min-w-[850px] text-sm">
+              <table className="w-full min-w-[1240px] text-sm">
                 <thead className="bg-[#f6f7f2] text-left text-xs text-muted-foreground">
                   <tr>
                     <th className="px-5 py-3 font-medium">标的</th>
                     <th className="px-4 py-3 font-medium">分类</th>
                     <th className="px-4 py-3 text-right font-medium">
-                      日元评价
+                      {portfolio.currency === 'JPY' ? '日元' : '美元'}评价
                     </th>
                     <th className="px-4 py-3 text-right font-medium">权重</th>
                     <th className="px-4 py-3 text-right font-medium">
-                      日元损益
+                      {portfolio.currency === 'JPY' ? '日元' : '外币'}损益
                     </th>
                     <th className="px-5 py-3 text-right font-medium">
-                      仓位信号
+                      类型总仓位信号
+                    </th>
+                    <th className="px-5 py-3 text-right font-medium">
+                      风控标签
                     </th>
                   </tr>
                 </thead>
                 <tbody>
-                  {portfolio.holdings
-                    .sort((a, b) => b.marketYen - a.marketYen)
-                    .map((item) => {
-                      const weight = total ? (item.marketYen / total) * 100 : 0;
-                      const category = categories[item.ticker] ?? 'satellite';
-                      const overCap = category !== 'core' && weight > 5;
-                      return (
-                        <tr key={item.ticker} className="border-t">
-                          <td className="px-5 py-3">
-                            <div className="flex items-center gap-3">
-                              <span className="grid size-9 place-items-center rounded-xl bg-[#edf1ed] text-xs font-bold text-[#24443d]">
-                                {item.ticker.slice(0, 2)}
-                              </span>
-                              <div>
-                                <p className="font-semibold">
-                                  {item.ticker}{' '}
-                                  <span className="ml-1 font-normal text-muted-foreground">
-                                    × {item.quantity}
-                                  </span>
+                  {sortedHoldings.map((item) => {
+                    const itemValue = positionValue(item);
+                    const weight = total ? (itemValue / total) * 100 : 0;
+                    const category = categories[item.ticker] ?? 'satellite';
+                    const categoryPct = total
+                      ? (allocation[category] / total) * 100
+                      : 0;
+                    const categoryGapPct = targets[category] - categoryPct;
+                    const tags = riskTags(item, category, weight);
+                    return (
+                      <tr key={item.ticker} className="border-t">
+                        <td className="px-5 py-3">
+                          <div className="flex items-center gap-3">
+                            <span className="grid size-9 place-items-center rounded-xl bg-[#edf1ed] text-xs font-bold text-[#24443d]">
+                              {item.ticker.slice(0, 2)}
+                            </span>
+                            <div>
+                              <p className="font-semibold">
+                                {item.ticker}{' '}
+                                <span className="ml-1 font-normal text-muted-foreground">
+                                  × {item.quantity}
+                                </span>
+                              </p>
+                              <p className="max-w-[280px] whitespace-normal text-xs leading-5 text-muted-foreground">
+                                {item.name}
+                              </p>
+                              {item.accounts.length > 0 && (
+                                <p className="mt-0.5 text-[10px] font-medium text-[#557269]">
+                                  {item.accounts.join(' + ')}
                                 </p>
-                                <p className="max-w-[180px] truncate text-xs text-muted-foreground">
-                                  {item.name}
-                                </p>
-                              </div>
-                            </div>
-                          </td>
-                          <td className="px-4 py-3">
-                            <select
-                              aria-label={`${item.ticker} 分类`}
-                              value={category}
-                              onChange={(event) =>
-                                setCategories((current) => ({
-                                  ...current,
-                                  [item.ticker]: event.target.value as Category,
-                                }))
-                              }
-                              className="max-w-[145px] rounded-lg border bg-white px-2 py-1.5 text-xs outline-none focus:ring-2 focus:ring-[#8faf52]"
-                            >
-                              <option value="core">核心长期仓</option>
-                              <option value="defensive">防守资产</option>
-                              <option value="satellite">优质个股仓</option>
-                              <option value="speculative">投机仓</option>
-                            </select>
-                          </td>
-                          <td className="px-4 py-3 text-right font-medium tabular-nums">
-                            {yen.format(item.marketYen)}
-                          </td>
-                          <td className="px-4 py-3 text-right">
-                            <p className="font-semibold tabular-nums">
-                              {weight.toFixed(1)}%
-                            </p>
-                            <div className="ml-auto mt-1 h-1.5 w-20 overflow-hidden rounded-full bg-[#e8ebe5]">
-                              <span
-                                className="block h-full rounded-full"
-                                style={{
-                                  width: `${Math.min(weight * 4, 100)}%`,
-                                  background: CATEGORY_META[category].color,
-                                }}
-                              />
-                            </div>
-                          </td>
-                          <td
-                            className={`px-4 py-3 text-right font-medium tabular-nums ${item.pnlYenPct >= 0 ? 'text-[#32755d]' : 'text-[#b45448]'}`}
-                          >
-                            <span className="inline-flex items-center gap-1">
-                              {item.pnlYenPct >= 0 ? (
-                                <ArrowUp size={13} />
-                              ) : (
-                                <ArrowDown size={13} />
                               )}
-                              {Math.abs(item.pnlYenPct).toFixed(2)}%
-                            </span>
-                          </td>
-                          <td className="px-5 py-3 text-right">
+                            </div>
+                          </div>
+                        </td>
+                        <td className="px-4 py-3">
+                          <select
+                            aria-label={`${item.ticker} 分类`}
+                            value={category}
+                            onChange={(event) =>
+                              setCategories((current) => ({
+                                ...current,
+                                [item.ticker]: event.target.value as Category,
+                              }))
+                            }
+                            className="w-[200px] rounded-lg border bg-white px-2 py-1.5 text-xs outline-none focus:ring-2 focus:ring-[#8faf52]"
+                          >
+                            <option value="core">核心长期仓</option>
+                            <option value="satellite">
+                              卫星仓（优质个股/行业ETF）
+                            </option>
+                            <option value="speculative">投机仓</option>
+                          </select>
+                        </td>
+                        <td className="px-4 py-3 text-right font-medium tabular-nums">
+                          {formatMoney(itemValue)}
+                        </td>
+                        <td className="px-4 py-3 text-right">
+                          <p className="font-semibold tabular-nums">
+                            {weight.toFixed(1)}%
+                          </p>
+                          <div className="ml-auto mt-1 h-1.5 w-20 overflow-hidden rounded-full bg-[#e8ebe5]">
                             <span
-                              className={`inline-flex rounded-full px-2.5 py-1 text-xs font-medium ${overCap ? 'bg-[#fbe9e5] text-[#a6463a]' : 'bg-[#edf0ef] text-[#586460]'}`}
-                            >
-                              {overCap ? '减至 5% 以内' : '保持 / 按类别调整'}
+                              className="block h-full rounded-full"
+                              style={{
+                                width: `${Math.min(weight * 4, 100)}%`,
+                                background: CATEGORY_META[category].color,
+                              }}
+                            />
+                          </div>
+                        </td>
+                        <td
+                          className={`px-4 py-3 text-right font-medium tabular-nums ${item.pnlPct >= 0 ? 'text-[#32755d]' : 'text-[#b45448]'}`}
+                        >
+                          <span className="inline-flex items-center gap-1">
+                            {item.pnlPct >= 0 ? (
+                              <ArrowUp size={13} />
+                            ) : (
+                              <ArrowDown size={13} />
+                            )}
+                            {Math.abs(item.pnlPct).toFixed(2)}%
+                          </span>
+                        </td>
+                        <td className="px-5 py-3 text-right">
+                          <span
+                            className={`inline-flex rounded-full px-2.5 py-1 text-xs font-medium ${!targetsAreValid ? 'bg-[#fff0cf] text-[#906414]' : categoryGapPct > 1.5 ? 'bg-[#edf5d8] text-[#355026]' : categoryGapPct < -1.5 ? 'bg-[#fbe9e5] text-[#a6463a]' : 'bg-[#edf0ef] text-[#586460]'}`}
+                          >
+                            {!targetsAreValid
+                              ? '请先将目标合计调整为100%'
+                              : categoryGapPct > 1.5
+                                ? `该类型：增持 ${categoryGapPct.toFixed(1)} 个百分点`
+                                : categoryGapPct < -1.5
+                                  ? `该类型：减持 ${Math.abs(categoryGapPct).toFixed(1)} 个百分点`
+                                  : '该类型：接近目标'}
+                          </span>
+                        </td>
+                        <td className="px-5 py-3 text-right">
+                          {tags.length ? (
+                            <div className="flex flex-wrap justify-end gap-1.5">
+                              {tags.map((tag) => (
+                                <span
+                                  key={tag.label}
+                                  className={`inline-flex rounded-full px-2.5 py-1 text-[11px] font-semibold ${
+                                    tag.tone === 'profit'
+                                      ? 'bg-[#e4f3e9] text-[#287052]'
+                                      : tag.tone === 'loss'
+                                        ? 'bg-[#fbe4e0] text-[#ad473a]'
+                                        : 'bg-[#e8f1f4] text-[#3f6878]'
+                                  }`}
+                                >
+                                  {tag.label}
+                                </span>
+                              ))}
+                            </div>
+                          ) : (
+                            <span className="text-xs text-muted-foreground">
+                              —
                             </span>
-                          </td>
-                        </tr>
-                      );
-                    })}
+                          )}
+                        </td>
+                      </tr>
+                    );
+                  })}
                 </tbody>
               </table>
+            </div>
+            <div className="border-t bg-[#fafbf7] px-5 py-3 text-[11px] leading-5 text-muted-foreground">
+              决策规则：目标配置只驱动“类型总仓位信号”和调仓缺口；风控标签按单标的规则独立判断。红色为止损，绿色为止盈，蓝色为再平衡。卫星仓下跌20%触发止损复核；单一标的超过5%时标记再平衡，如已有盈利则另行标记止盈。投机仓单标的超过2%归类为再平衡；下跌8%进入止损区间，盈利20%
+              / 40%分别触发第一次 / 第二次止盈。核心ETF不设机械价格止损。
             </div>
           </section>
         </div>
@@ -472,11 +779,11 @@ export default function Home() {
               <div>
                 <h2 className="font-semibold">目标配置与调仓缺口</h2>
                 <p className="mt-1 text-xs text-muted-foreground">
-                  直接修改目标；差额按当前总资产计算
+                  四仓模型：核心55% / 卫星30% / 投机5% / 现金10%
                 </p>
               </div>
               <span
-                className={`rounded-full px-3 py-1 text-xs font-semibold ${targetTotal === 100 ? 'bg-[#edf5d8] text-[#355026]' : 'bg-[#fbe9e5] text-[#a6463a]'}`}
+                className={`rounded-full px-3 py-1 text-xs font-semibold ${targetsAreValid ? 'bg-[#edf5d8] text-[#355026]' : 'bg-[#fbe9e5] text-[#a6463a]'}`}
               >
                 目标合计 {targetTotal}%
               </span>
@@ -484,6 +791,7 @@ export default function Home() {
             <div className="space-y-2">
               {categoryKeys.map((key) => {
                 const currentPct = total ? (allocation[key] / total) * 100 : 0;
+                const gapPct = targets[key] - currentPct;
                 const gap = (total * targets[key]) / 100 - allocation[key];
                 return (
                   <div
@@ -518,62 +826,31 @@ export default function Home() {
                       </span>
                     </label>
                     <div
-                      className={`text-right text-sm font-semibold tabular-nums ${gap > 500 ? 'text-[#32755d]' : gap < -500 ? 'text-[#b45448]' : 'text-muted-foreground'}`}
+                      className={`text-right tabular-nums ${gapPct > 0.1 ? 'text-[#32755d]' : gapPct < -0.1 ? 'text-[#b45448]' : 'text-muted-foreground'}`}
                     >
-                      {gap > 500 ? '+' : ''}
-                      {yen.format(Math.round(gap))}
+                      <p className="text-sm font-semibold">
+                        {gap > 0 ? '+' : ''}
+                        {formatMoney(Math.round(gap))}
+                      </p>
+                      <p className="mt-0.5 text-[11px] font-medium">
+                        {gapPct > 0 ? '+' : ''}
+                        {gapPct.toFixed(1)} 个百分点
+                      </p>
                     </div>
                     <span
-                      className={`hidden justify-self-end rounded-full px-2.5 py-1 text-xs font-medium sm:inline-flex ${gap > total * 0.015 ? 'bg-[#edf5d8] text-[#355026]' : gap < -total * 0.015 ? 'bg-[#fbe9e5] text-[#a6463a]' : 'bg-[#edf0ef] text-[#586460]'}`}
+                      className={`hidden justify-self-end rounded-full px-2.5 py-1 text-xs font-medium sm:inline-flex ${!targetsAreValid ? 'bg-[#fff0cf] text-[#906414]' : gap > total * 0.015 ? 'bg-[#edf5d8] text-[#355026]' : gap < -total * 0.015 ? 'bg-[#fbe9e5] text-[#a6463a]' : 'bg-[#edf0ef] text-[#586460]'}`}
                     >
-                      {gap > total * 0.015
-                        ? '建议增持'
-                        : gap < -total * 0.015
-                          ? '建议减持'
-                          : '接近目标'}
+                      {!targetsAreValid
+                        ? '等待合计100%'
+                        : gap > total * 0.015
+                          ? '建议增持'
+                          : gap < -total * 0.015
+                            ? '建议减持'
+                            : '接近目标'}
                     </span>
                   </div>
                 );
               })}
-            </div>
-          </article>
-        </section>
-
-        <section className="mt-5 grid gap-4 md:grid-cols-2">
-          <article className="rounded-2xl border border-[#efd2cb] bg-[#fff9f7] p-5">
-            <div className="flex gap-3">
-              <span className="grid size-9 shrink-0 place-items-center rounded-xl bg-[#fbe9e5] text-[#a6463a]">
-                <AlertTriangle size={18} />
-              </span>
-              <div>
-                <h3 className="font-semibold">集中度预警</h3>
-                <p className="mt-1 text-sm leading-6 text-muted-foreground">
-                  {portfolio.holdings.filter(
-                    (item) => total && item.marketYen / total > 0.05,
-                  ).length
-                    ? `${portfolio.holdings
-                        .filter((item) => item.marketYen / total > 0.05)
-                        .map((item) => item.ticker)
-                        .join(
-                          '、',
-                        )} 已超过单只 5% 的风险上限。宽基 ETF 可按核心仓规则另行管理。`
-                    : '当前没有单只证券超过 5%。'}
-                </p>
-              </div>
-            </div>
-          </article>
-          <article className="rounded-2xl border border-[#d6e0ca] bg-[#f9fcf2] p-5">
-            <div className="flex gap-3">
-              <span className="grid size-9 shrink-0 place-items-center rounded-xl bg-[#edf5d8] text-[#547a42]">
-                <Scale size={18} />
-              </span>
-              <div>
-                <h3 className="font-semibold">执行顺序</h3>
-                <p className="mt-1 text-sm leading-6 text-muted-foreground">
-                  先用现金和新增资金补足缺口最大的类别，再分批处理超配仓位。只在类别偏离目标超过
-                  5 个百分点时调仓。
-                </p>
-              </div>
             </div>
           </article>
         </section>
