@@ -1,4 +1,4 @@
-# Portfolio Compass
+![截屏2026-09-11 16 01 08](https://github.com/user-attachments/assets/4a3691c6-30ef-42bf-9f92-aa1e15831e23)# Portfolio Compass
 
 一个本地运行的美股持仓分析工具。可自动计算持仓权重、分类仓位、调仓缺口及风险标签。
 
@@ -14,6 +14,18 @@
 - 显示止盈、止损及再平衡标签
 - 所有数据仅在浏览器中处理
 
+
+
+<img 
+  src="https://github.com/user-attachments/assets/c54f3d6c-6da4-4e9b-9201-715f5c2cea2c" 
+  alt="1" 
+  width="800">
+
+  <img 
+  src="https://github.com/user-attachments/assets/ea307141-50d3-4720-9ff1-deb42cfabcb2" 
+  alt="2" 
+  width="800">
+  
 ## 默认仓位模型
 
 | 类型 | 目标比例 |
