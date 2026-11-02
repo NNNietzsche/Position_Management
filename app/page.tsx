@@ -106,7 +106,7 @@ DEMONASDAQ
 30,000 円`;
 
 function numberOf(value: string) {
-  return Number(value.replace(/[,+]/g, ''));
+  return Number(value.replace(/[,+]/g, '').replace(/\s*(?:USD|円|%)\s*$/, ''));
 }
 
 function parseDetailedPortfolio(lines: string[]) {
